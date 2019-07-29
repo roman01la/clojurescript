@@ -3099,7 +3099,8 @@
    (variadic-fn* sym method true))
   ([sym [arglist & body :as method] solo]
    (core/let [sig (remove '#{&} arglist)
-              restarg (gensym "seq")]
+              restarg (gensym "seq")
+              async? (-> sym meta :async)]
      (core/letfn [(get-delegate []
                     'cljs$core$IFn$_invoke$arity$variadic)
                   (get-delegate-prop []
@@ -3119,16 +3120,17 @@
                          ([~restarg]
                           (this-as self#
                             (. self# (~(get-delegate) (seq ~restarg))))))))]
-       `(do
-          (set! (. ~sym ~(get-delegate-prop))
-            (fn (~(vec sig) ~@body)))
-          ~@(core/when solo
-              `[(set! (. ~sym ~'-cljs$lang$maxFixedArity)
-                  ~(core/dec (count sig)))])
-          (js-inline-comment " @this {Function} ")
-          ;; dissoc :top-fn so this helper gets ignored in cljs.analyzer/parse 'set!
-          (set! (. ~(vary-meta sym dissoc :top-fn) ~'-cljs$lang$applyTo)
-            ~(apply-to)))))))
+       (core/let [delegate-name (with-meta (gensym "dp") {:async async?})]
+         `(do
+            (set! (. ~sym ~(get-delegate-prop))
+                  (fn ~delegate-name (~(vec sig) ~@body)))
+            ~@(core/when solo
+                `[(set! (. ~sym ~'-cljs$lang$maxFixedArity)
+                        ~(core/dec (count sig)))])
+            (js-inline-comment " @this {Function} ")
+            ;; dissoc :top-fn so this helper gets ignored in cljs.analyzer/parse 'set!
+            (set! (. ~(vary-meta sym dissoc :top-fn) ~'-cljs$lang$applyTo)
+                  ~(apply-to))))))))
 
 (core/defmacro copy-arguments [dest]
   `(let [len# (alength (js-arguments))]

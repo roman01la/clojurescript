@@ -1325,7 +1325,8 @@
 ;; Note: This is the set of parse multimethod dispatch values,
 ;; along with '&, and differs from cljs.core/special-symbol?
 (def specials '#{if def fn* do let* loop* letfn* throw try recur new set!
-                 ns deftype* defrecord* . js* & quote case* var ns*})
+                 ns deftype* defrecord* . js* & quote case* var ns*
+                 await})
 
 (def ^:dynamic *recur-frames* nil)
 (def ^:dynamic *loop-lets* ())
@@ -1451,6 +1452,7 @@
         :loop     (infer-tag env (:body e))
         :do       (infer-tag env (:ret e))
         :fn-method (infer-tag env (:body e))
+        :async-fn 'js/Promise
         :def      (infer-tag env (:init e))
         :invoke   (infer-invoke env e)
         :if       (infer-if env e)
@@ -1506,6 +1508,16 @@
         {:var  (analyze expr-env sym)
          :sym  (analyze expr-env `(quote ~(symbol (name var-ns) (name (:name var)))))
          :meta (var-meta var expr-env)}))))
+
+(defmethod parse 'await
+  [op env [_ expr :as form] _ _]
+  (when (not= 2 (count form))
+    (throw (error env "Wrong number of args to await")))
+  {:env env
+   :op :await
+   :children [:expr]
+   :expr (analyze env expr)
+   :form form})
 
 (defmethod parse 'var
   [op env [_ sym :as form] _ _]
@@ -1900,7 +1912,9 @@
                       (disallowing-recur
                         (disallowing-ns*
                           (analyze (assoc env :context :expr) (:init args) sym))))
-          fn-var? (and (some? init-expr) (= (:op init-expr) :fn))
+          fn-var? (and (some? init-expr)
+                       (or (= (:op init-expr) :fn)
+                           (= (:op init-expr) :async-fn)))
           tag (cond
                 fn-var? (or (:ret-tag init-expr) tag (:inferred-ret-tag init-expr))
                 tag tag
@@ -2105,6 +2119,7 @@
         [name meths] (if named-fn?
                          [(first args) (next args)]
                          [name (seq args)])
+        async? (-> name meta :async)
         ;; turn (fn [] ...) into (fn ([]...))
         meths        (if (vector? (first meths))
                        (list meths)
@@ -2151,9 +2166,11 @@
                        [:local :methods]
                        [:methods])
         inferred-ret-tag (let [inferred-tags (map (partial infer-tag env) (map :body methods))]
-                           (when (apply = inferred-tags)
-                             (first inferred-tags)))
-        ast   (merge {:op :fn
+                           (cond
+                             async? 'js/Promise
+                             (apply = inferred-tags) (first inferred-tags)
+                             :else nil))
+        ast   (merge {:op (if async? :async-fn :fn)
                       :env env
                       :form form
                       :name name-var
