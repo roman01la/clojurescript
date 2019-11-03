@@ -14,16 +14,17 @@
               :refer [no-warn wrapping-errors with-warning-handlers
                       disallowing-recur allowing-redef disallowing-ns*]]
              [cljs.env.macros :refer [ensure]]))
-  #?(:clj (:require [cljs.util :as util :refer [ns->relpath topo-sort]]
-                    [clojure.java.io :as io]
-                    [clojure.string :as string]
-                    [clojure.set :as set]
-                    [cljs.env :as env :refer [ensure]]
-                    [cljs.js-deps :as deps]
-                    [cljs.tagged-literals :as tags]
-                    [clojure.tools.reader :as reader]
-                    [clojure.tools.reader.reader-types :as readers]
-                    [clojure.edn :as edn])
+  #?(:clj  (:require [cljs.util :as util :refer [ns->relpath topo-sort]]
+                     [clojure.java.io :as io]
+                     [clojure.string :as string]
+                     [clojure.set :as set]
+                     [cljs.env :as env :refer [ensure]]
+                     [cljs.js-deps :as deps]
+                     [cljs.tagged-literals :as tags]
+                     [clojure.tools.reader :as reader]
+                     [clojure.tools.reader.reader-types :as readers]
+                     [clojure.edn :as edn]
+                     [cljs.externs :as externs])
      :cljs (:require [goog.string :as gstring]
                      [clojure.string :as string]
                      [clojure.set :as set]
@@ -1611,6 +1612,8 @@
                        (get-in env [:locals sym]))
               [sym tag])))))))
 
+(declare specials)
+
 (defn- type-check-induced-tag
   "Look for a type-check-induced tag when the test expression is the use of
   instance? on a local, as in (instance? UUID x) or implements? on a local, as
@@ -1618,7 +1621,8 @@
   [env test]
   (when (and (list? test)
              (== 3 (count test))
-             (every? symbol? test))
+             (every? symbol? test)
+             (not (contains? specials (first test))))
     (let [analyzed-fn (no-warn (analyze (assoc env :context :expr) (first test)))]
       (when (= :var (:op analyzed-fn))
         (when ('#{cljs.core/instance? cljs.core/implements?} (:name analyzed-fn))
@@ -2420,7 +2424,11 @@
     (reset! (:flag frame) true)
     (swap! (:tags frame) (fn [tags]
                            (mapv (fn [tag expr]
-                                   (add-types tag (:tag expr)))
+                                   ;; Widen by adding the type of the recur expression, except when recurring with a
+                                   ;; loop local: Since its final widened type is unknown, conservatively assume 'any.
+                                   (if (= :loop (:local expr))
+                                     'any
+                                     (add-types tag (:tag expr))))
                              tags exprs)))
     (assoc {:env env :op :recur :form form}
       :frame frame
@@ -2593,18 +2601,23 @@
                  (some *cljs-dep-set* deps))))))
        (doseq [dep deps]
          (when-not (or (some? (get-in compiler [::namespaces dep :defs]))
-                       (contains? (:js-dependency-index compiler) (name dep))
                        (node-module-dep? dep)
                        (js-module-exists? (name dep))
                        #?(:clj (deps/find-classpath-lib dep)))
-           #?(:clj (if-some [src (locate-src dep)]
-                     (analyze-file src opts)
-                     (throw
-                       (error env
-                         (error-message :undeclared-ns {:ns-sym dep :js-provide (name dep)}))))
-              :cljs (throw
-                      (error env
-                        (error-message :undeclared-ns {:ns-sym dep :js-provide (name dep)}))))))))))
+           (if (contains? (:js-dependency-index compiler) (name dep))
+             (let [dep-name (name dep)]
+               (when (string/starts-with? dep-name "goog.")
+                 #?(:clj (let [js-lib (get-in compiler [:js-dependency-index dep-name])
+                               ns (externs/analyze-goog-file (:file js-lib) (symbol dep-name))]
+                           (swap! env/*compiler* update-in [::namespaces dep] merge ns)))))
+             #?(:clj (if-some [src (locate-src dep)]
+                       (analyze-file src opts)
+                       (throw
+                         (error env
+                           (error-message :undeclared-ns {:ns-sym dep :js-provide (name dep)}))))
+                :cljs (throw
+                        (error env
+                          (error-message :undeclared-ns {:ns-sym dep :js-provide (name dep)})))))))))))
 
 (defn missing-use? [lib sym cenv]
   (let [js-lib (get-in cenv [:js-dependency-index (name lib)])]
@@ -3596,7 +3609,8 @@
 (defn- valid-arity?
   #?(:cljs {:tag boolean})
   [argc method-params]
-  (boolean (some #{argc} (map count method-params))))
+  (or (nil? method-params)  ; Assume valid if method-params unavailable
+      (boolean (some #{argc} (map count method-params)))))
 
 (defn- record-tag?
   [tag]
@@ -3625,7 +3639,8 @@
   (let [enve    (assoc env :context :expr)
         fexpr   (analyze enve f)
         argc    (count args)
-        fn-var? (-> fexpr :info :fn-var)
+        fn-var? (or (-> fexpr :info :fn-var)
+                    (-> fexpr :info :js-fn-var))
         kw?     (= 'cljs.core/Keyword (:tag fexpr))
         cur-ns  (-> env :ns :name)
         HO-invoke? (and (boolean *cljs-static-fns*)

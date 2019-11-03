@@ -15,11 +15,12 @@
             CompilerOptions SourceFile JsAst CommandLineRunner]
            [com.google.javascript.jscomp.parsing Config$JsDocParsing]
            [com.google.javascript.rhino
-            Node Token JSTypeExpression]
+            Node Token JSTypeExpression JSDocInfo$Visibility]
            [java.util.logging Level]))
 
 (def ^:dynamic *ignore-var* false)
 (def ^:dynamic *source-file* nil)
+(def ^:dynamic *goog-ns* nil)
 
 ;; ------------------------------------------------------------------------------
 ;; Externs Parsing
@@ -33,10 +34,19 @@
 (defn get-tag [^JSTypeExpression texpr]
   (when-let [root (.getRoot texpr)]
     (if (.isString root)
-      (symbol (.getString root))
-      (if-let [child (.. root getFirstChild)]
+      (symbol (.getString root))(if-let [child (.. root getFirstChild)]
         (if (.isString child)
           (symbol (.. child getString)))))))
+
+(defn params->method-params [xs]
+  (letfn [(not-opt? [x]
+            (not (string/starts-with? (name x) "opt_")))]
+    (let [required (into [] (take-while not-opt? xs))
+          opts (drop-while not-opt? xs)]
+      (loop [ret [required] opts opts]
+        (if-let [opt (first opts)]
+          (recur (conj ret (conj (last ret) opt)) (drop 1 opts))
+          (seq ret))))))
 
 (defn get-var-info [^Node node]
   (when node
@@ -50,14 +60,25 @@
                 (cond-> {:tag 'Function}
                   (.isConstructor info) (merge {:ctor qname})
                   (.isInterface info) (merge {:iface qname})))
-              (if (.hasReturnType info)
-                {:tag 'Function
-                 :ret-tag (get-tag (.getReturnType info))
-                 :arglists (list (into [] (map symbol (.getParameterNames info))))})))
+              (if (or (.hasReturnType info)
+                      (as-> (.getParameterCount info) c
+                        (and c (pos? c))))
+                (let [arglist  (into [] (map symbol (.getParameterNames info)))
+                      arglists (params->method-params arglist)]
+                  {:tag             'Function
+                   :js-fn-var       true
+                   :ret-tag         (or (some-> (.getReturnType info) get-tag)
+                                        'clj-nil)
+                   :variadic?       (boolean (some '#{var_args} arglist))
+                   :max-fixed-arity (count (take-while #(not= 'var_args %) arglist))
+                   :method-params   arglists
+                   :arglists        arglists}))))
           {:file *source-file*
            :line (.getLineno node)}
           (when-let [doc (.getOriginalCommentString info)]
-            {:doc doc}))))))
+            {:doc doc})
+          (when (= JSDocInfo$Visibility/PRIVATE (.getVisibility info))
+            {:private true}))))))
 
 (defmulti parse-extern-node
   (fn [^Node node]
@@ -171,21 +192,47 @@
            externs (index-externs (parse-externs externs-file))))
        defaults sources))))
 
-(defn analyze-goog-file [f]
-  (let [rsrc (io/resource f)
-        desc (js-deps/parse-js-ns (line-seq (io/reader rsrc)))]
-    ;; TODO: figure out what to do about other provides
-    [(first (:provides desc))
-     ]))
+(defn ns-match? [ns-segs var-segs]
+  (and
+    (= (inc (count ns-segs)) (count var-segs))
+    (= ns-segs (take (count ns-segs) var-segs))))
+
+(defn parsed->defs [externs]
+  (let [ns-segs (into [] (map symbol (string/split (str *goog-ns*) #"\.")))]
+    (reduce
+      (fn [m xs]
+        ;; ignore definitions from other provided namespaces not under consideration
+        (if (ns-match? ns-segs xs)
+          (let [sym (last xs)]
+            (cond-> m
+              (seq xs) (assoc sym (merge (meta sym) {:ns *goog-ns* :name sym}))))
+          m))
+      {} externs)))
+
+(defn analyze-goog-file
+  ([f]
+   (analyze-goog-file f nil))
+  ([f ns]
+   (let [rsrc (io/resource f)
+         desc (js-deps/parse-js-ns (line-seq (io/reader rsrc)))
+         ns   (or ns (-> (:provides desc) first symbol))]
+     (binding [*goog-ns* ns]
+       {:name ns
+        :defs (parsed->defs
+                (parse-externs
+                  (SourceFile/fromInputStream f (io/input-stream rsrc))))}))))
 
 (comment
-
-  (analyze-goog-file "goog/string/string.js")
-
   (require '[clojure.java.io :as io]
            '[cljs.closure :as closure]
            '[clojure.pprint :refer [pprint]]
            '[cljs.js-deps :as js-deps])
+
+  (pprint
+    (get-in (analyze-goog-file "goog/dom/dom.js")
+      [:defs 'setTextContent]))
+
+  (pprint (analyze-goog-file "goog/string/string.js"))
 
   (get (js-deps/js-dependency-index {}) "goog.string")
 
@@ -202,10 +249,22 @@
     (closure/js-source-file "goog/string/string.js"
       (io/input-stream (io/resource "goog/string/string.js"))))
 
-  (externs-map
-    [(closure/js-source-file "goog/string/string.js"
-       (io/input-stream (io/resource "goog/string/string.js")))]
-    {})
+  (-> (externs-map
+        [(closure/js-source-file "goog/string/string.js"
+           (io/input-stream (io/resource "goog/string/string.js")))]
+        {})
+    (get-in '[goog string])
+    (find 'numberAwareCompare_)
+    first meta)
+
+  (-> (externs-map
+        [(closure/js-source-file "goog/date/date.js"
+           (io/input-stream (io/resource "goog/date/date.js")))]
+        {})
+    (get-in '[goog date month])
+    )
+
+  (pprint (analyze-goog-file "goog/date/date.js" 'goog.date.month))
 
   (externs-map)
 

@@ -1973,9 +1973,11 @@ reduces them without incurring seq initialization"
    val(s). When applied to a vector, returns a new vector that
    contains val at index. Note - index must be <= (count vector)."
   ([coll k v]
-    (if-not (nil? coll)
-      (-assoc coll k v)
-      (array-map k v)))
+   (if (implements? IAssociative coll)
+     (-assoc coll k v)
+     (if-not (nil? coll)
+       (-assoc coll k v)
+       (array-map k v))))
   ([coll k v & kvs]
      (let [ret (assoc coll k v)]
        (if kvs
@@ -6147,9 +6149,11 @@ reduces them without incurring seq initialization"
   ILookup
   (-lookup [coll k] (-lookup coll k nil))
 
-  (-lookup [coll k not-found] (if (number? k)
-                                (-nth coll k not-found)
-                                not-found))
+  (-lookup [coll k not-found]
+    (cond
+      (not ^boolean (.-edit root)) (throw (js/Error. "lookup after persistent!"))
+      (number? k) (-nth coll k not-found)
+      :else not-found))
 
   IFn
   (-invoke [coll k]
